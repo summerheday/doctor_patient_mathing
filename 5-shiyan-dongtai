@@ -1,0 +1,239 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 11 16:13:53 2019
+
+@author: iamhe
+"""
+
+import pandas as pd
+import numpy as np
+import pymysql
+import math
+import patient_information as pm
+import shiyan5_hanshu as syhs
+
+db = pymysql.connect(host='localhost', user='root', password='hexin123', port=3306, db='finalpaper')
+cursor = db.cursor()
+question = pd.read_sql("SELECT * FROM question",db)
+doctor = pd.read_sql("SELECT * FROM doctor",db)
+db.close()
+
+#医生从医信息三个特征值
+#将医院级别数值化
+doctor['hospital_level_num'] = doctor['hospital_level'].apply(lambda x: 1 if x == "0" else (2 if x == "医保" else (3 if x == "三甲医院" else 4)))
+#将医生职称数值化
+doctor['doctor_level_num'] = doctor['job_title_name'].apply(lambda x: 5 if x == "主任医师" else (4 if x == "副主任医师" else (3 if x == "主治医师" else (2 if x == "医师" else 1))))
+#将医生从医年限数值化
+doctor['work_year_num'] = doctor['work_year'].apply(lambda x: math.ceil(x/5))
+
+#读取态度得分
+attitude = pd.read_csv("attitude_score.csv",encoding="utf_8_sig")       
+doctor_attitude = pd.merge(doctor,attitude,on=['doctor_id'])
+ 
+#前景理论固定参数
+alpha = 0.88
+theta = 2.25
+beta = 0.88
+eta = 0.61
+etb = 0.69
+
+#价值训练好的lda和d2v模型
+import warnings
+warnings.filterwarnings(action='ignore',category=UserWarning,module='gensim')
+from sklearn.externals import joblib
+d2v_model = joblib.load('d2v_model.m')
+d2v_model.init_sims(replace=True)            
+
+lda_model = joblib.load('lda_model.m')
+tfidf_model = joblib.load('tfidf_model.m')
+
+import jieba
+stopwords = []
+stopword = open('stopwords_chinese.txt',encoding='utf-8')
+for line in stopword:
+    stopwords.append(line.strip())
+def word_cut(sentence):
+    if len(sentence) == 0:
+        return "null"
+    else:
+        words = jieba.cut(sentence, cut_all=False)       
+        words = [c for c in words if len(c) > 1]
+        words = [c for c in words if c not in stopwords]
+        return words     
+from gensim import corpora
+doc_list = []
+for i in range(len(question)):
+    ss = question['questions'].iloc[i] + question['answers'].iloc[i]
+    doc_list.append(word_cut(ss))
+# 构建词空间
+dictionary = corpora.Dictionary(doc_list)
+       
+#读取代表性问题
+represent_ques = np.load('represent_ques.npy')
+represent_ques = represent_ques.tolist()
+v_membership_n = pd.read_csv("v_membership.csv",encoding='utf_8_sig')
+v_membership = np.zeros((len(v_membership_n),100))  
+#对v_membership_n按行标准化
+for i in range(len(v_membership_n)):
+    s = 0
+    for j in range(100):
+        s += v_membership_n["expertise_{}".format(j+1)].iloc[i]
+    for j in range(100):
+        v_membership[i][j] = v_membership_n["expertise_{}".format(j+1)].iloc[i]/s
+v_membership = pd.DataFrame(v_membership, columns=['expertise_{}'.format(i) for i in range(1,101)]) 
+v_membership['vertex'] = v_membership_n['vertex']
+
+#代表性问题向量化
+repre_question = []
+for i in range(100):
+    sss = ''
+    for j in range(len(represent_ques[i])):
+        sss += question["questions"][question.question_id == represent_ques[i][j]].iloc[0]
+    ss_vec = d2v_model.infer_vector(word_cut(sss))
+    repre_question.append(ss_vec)
+    
+#计算每位医生lda
+qa=[]
+question['qa_pairs'] = question['questions'] + question['answers']
+for i in range(len(doctor)):
+    q=question[question['doctor_id']==doctor['doctor_id'].iloc[i]]['qa_pairs']
+    sss=''
+    for j in q:
+        sss=sss+j
+    qa.append(sss)
+doctor.insert(22,'qapairs',qa)
+doctor["doc"] = doctor["shanchangfangxiang"] + "。"+ doctor["self_desc"] + "。"+ doctor["zhiyejingli"]  + "。"+ doctor["xueshujingli"]+ "。"+ doctor["zhuanyezili"]
+doctor_lda = []
+for i in range(len(doctor)):
+    dlda = [0]*100
+    doc = []
+    doc.extend(word_cut(str(doctor["doc"].iloc[i])))
+    doc.extend(word_cut(doctor["qapairs"].iloc[i]))
+    sentcorpus = tfidf_model[dictionary.doc2bow(doc)]
+    senttopic = lda_model[sentcorpus]
+    for j in range(len(senttopic)):
+        dlda[senttopic[j][0]] = senttopic[j][1]
+    doctor_lda.append(dlda)    
+
+
+#十分钟为一个时间维度，此处实验3个小时的数据，即匹配18次
+y1_our,f1_our,f2_our,A_our,B_our,satis_patient_our,satis_doctor_our = [],[],[],[],[],[],[]
+y1_fan,f1_fan,f2_fan,A_fan,B_fan,satis_patient_fan,satis_doctor_fan = [],[],[],[],[],[],[]
+y1_our_static,f1_our_static,f2_our_static,A_our_static,B_our_static,satis_patient_our_static,satis_doctor_our_static = [],[],[],[],[],[],[]
+y1_fan_static,f1_fan_static,f2_fan_static,A_fan_static,B_fan_static,satis_patient_fan_static,satis_doctor_fan_static = [],[],[],[],[],[],[]
+
+doctor_s = []    
+for time in range(0,10):
+    #患者和医生端的随机种子
+    random_seed = 5 * (time + 1)
+    doctor_seed = 2 * (time + 1)   
+    #生成患者端的人数
+    n = np.random.randint(1,5) * 100
+    #随机生成医生的状态和待问答问题集合
+    s = np.random.randint(5, size=len(doctor))
+    doctor_s.append(s)
+    m = len(doctor)
+    #生成待匹配问题
+    question_n = question.sample(n=n,random_state=doctor_seed,replace=False).reset_index(drop = True)
+    question_n.question_vec = question_n.questions.apply(lambda x:d2v_model.infer_vector(word_cut(x)))
+    #获得我们方法的患者和医生端的满意度
+    ss,powa_w,SD_patient,SD_doctor = syhs.our_satisfaction(n,m,doctor,random_seed,attitude,question_n,v_membership,repre_question)
+    print("终于完成1步")
+    #获得fan的方法的患者和医生端的满意度
+    SD_patient_fan,SD_doctor_fan = syhs.fan_satisfaction(n,m,powa_w,ss,doctor_attitude,doctor,question_n,doctor_lda,tfidf_model,lda_model,dictionary)
+    print("终于完成2步")
+    #计算我们方法的匹配结果
+    try:
+        y1_our.append(syhs.patient_model(SD_patient,SD_doctor,n,m,1,s))
+        print("终于完成3步")
+        ff2_our,ff1_our,AA_our,BB_our,satis_p_our,satis_d_our = syhs.doctor_model(SD_patient,SD_doctor,n,m,1,s,y1_our[time],4)
+        print(ff2_our,ff1_our,"终于完成4步")
+        f1_our.append(ff1_our)
+        f2_our.append(ff2_our)
+        A_our.append(AA_our)
+        B_our.append(BB_our)
+        satis_patient_our.append(satis_p_our)
+        satis_doctor_our.append(satis_d_our)
+    except:
+        f1_our.append("none")
+        f2_our.append("none")
+        A_our.append("none")
+        B_our.append("none")
+        satis_patient_our.append("none")
+        satis_doctor_our.append("none")        
+    #计算fan方法的匹配结果
+    try:
+        y1_fan.append(syhs.patient_model(SD_patient_fan,SD_doctor_fan,n,m,1,s))
+        print("终于完成5步")
+        ff2_fan,ff1_fan,AA_fan,BB_fan,satis_p_fan,satis_d_fan = syhs.doctor_model(SD_patient_fan,SD_doctor_fan,n,m,1,s,y1_fan[time],4)
+        print(ff2_fan,ff1_fan,"终于完成6步")
+        f1_fan.append(ff1_fan)
+        f2_fan.append(ff2_fan)
+        A_fan.append(AA_fan)
+        B_fan.append(BB_fan)
+        satis_patient_fan.append(satis_p_fan)
+        satis_doctor_fan.append(satis_d_fan)
+    except:
+        f1_fan.append("none")
+        f2_fan.append("none")
+        A_fan.append("none")
+        B_fan.append("none")
+        satis_patient_fan.append("none")
+        satis_doctor_fan.append("none")        
+    #计算我们方法的静态匹配结果
+    try:
+        static = [5] * m
+        y1_our_static.append(syhs.patient_model(SD_patient,SD_doctor,n,m,1,static))
+        print("终于完成7步")
+        ff2_our_static,ff1_our_static,AA_our_static,BB_our_static,satis_p_our_static,satis_d_our_static = syhs.doctor_model(SD_patient,SD_doctor,n,m,1,static,y1_our_static[time],4)
+        print(ff2_our_static,ff1_our_static,"终于完成8步")
+        f1_our_static.append(ff1_our_static)
+        f2_our_static.append(ff2_our_static)
+        A_our_static.append(AA_our_static)
+        B_our_static.append(BB_our_static)
+        satis_patient_our_static.append(satis_p_our_static)
+        satis_doctor_our_static.append(satis_d_our_static)
+    except:
+        f1_our_static.append("none")
+        f2_our_static.append("none")
+        A_our_static.append("none")
+        B_our_static.append("none")
+        satis_patient_our_static.append("none")
+        satis_doctor_our_static.append("none")        
+    #计算fan方法的静态匹配结果
+    try:
+        y1_fan_static.append(syhs.patient_model(SD_patient_fan,SD_doctor_fan,n,m,1,static))
+        print("终于完成9步")
+        ff2_fan_static,ff1_fan_static,AA_fan_static,BB_fan_static,satis_p_fan_static,satis_d_fan_static = syhs.doctor_model(SD_patient_fan,SD_doctor_fan,n,m,1,static,y1_fan_static[time],4)
+        print(ff2_fan_static,ff1_fan_static,"终于完成10步")
+        f1_fan_static.append(ff1_fan_static)
+        f2_fan_static.append(ff2_fan_static)
+        A_fan_static.append(AA_fan_static)
+        B_fan_static.append(BB_fan_static)
+        satis_patient_fan_static.append(satis_p_fan_static)
+        satis_doctor_fan_static.append(satis_d_fan_static) 
+        print("终于完成一次实验啦")
+    except:
+        f1_fan_static.append("none")
+        f2_fan_static.append("none")
+        A_fan_static.append("none")
+        B_fan_static.append("none")
+        satis_patient_fan_static.append("none")
+        satis_doctor_fan_static.append("none") 
+    
+doctor_id = [ int(i) for i in doctor['doctor_id']] 
+for i in range(len(B_fan)):
+    #统计每轮医生回答问题数
+    d = {} #给出字典
+    for x in B_fan[i]:
+        if x in d:
+           d[x]=d[x]+1
+        else:
+           d[x]=1
+    #和医生状态进行比较
+    rate = 0
+    for j in d.keys():
+        if doctor_s[i][j] >= d[j]:
+            rate += 1  
+    print(rate/len(d))
+
